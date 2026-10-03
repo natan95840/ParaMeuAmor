@@ -715,7 +715,7 @@ const CONFIG = {
   /* ---- Data e hora exatas em que começaram a namorar ----
      Formato: "AAAA-MM-DDTHH:MM:SS" (horário local do aparelho).
      O diário usa só dia e mês; o ano e a hora entram no contador de tempo. */
-  inicioNamoro: "2026-06-30T14:30:00-03:00",   // 30 de junho de 2026, 14:30 (horário de Brasília)
+  inicioNamoro: "2026-06-30T16:40:00-03:00",   // 30 de junho de 2026, 16:40 (horário de Brasília)
 
   /* ---- Capa ---- */
   capa: {
@@ -810,29 +810,33 @@ const CONFIG = {
   },
 
   /* ---- 6. Nossa Música ----
-     Toca só enquanto a pessoa estiver nessa página. Ao sair, o volume desce até parar. */
+     Começa ao entrar na página. Ao sair, continua tocando baixinha e abafada (como se viesse de outro cômodo). */
   musica: {
     arquivos: ["Sounds/Musica_Lisboa.ogg"],  // o navegador usa o primeiro formato que souber tocar.
                                              // iPhone não toca .ogg: acrescente uma cópia em .mp3 na lista,
                                              // ex.: ["Sounds/Musica_Lisboa.ogg", "Sounds/Musica_Lisboa.mp3"]
     capa: "Sounds/Capa_Musica.jpg",
     titulo: "Lisboa",                        // tirei do nome do arquivo: confirme
-    artista: "ANA VITÓRIA",                             // deixe vazio para não mostrar
-    volume: 0.7,                             // volume da música (0 a 1)
+    artista: "",                             // deixe vazio para não mostrar
+    volume: 0.7,                             // volume na página da música (0 a 1)
     fadeEntrada: 1200,                       // ms para o volume subir ao entrar na página
-    fadeSaida: 1800,                         // ms para o volume descer ao sair
-    repetir: true,                           // volta ao começo quando termina, enquanto estiver na página
-    recomecarAoVoltar: false                 // false = retoma de onde parou; true = sempre do início
+    fadeSaida: 1800,                         // ms da transição ao sair da página
+    ficarAoFundo: true,                      // true = ao sair continua baixinha; false = para de vez
+    volumeAoFundo: 0.15,                     // volume nas outras páginas (0 a 1)
+    abafado: true,                           // efeito "abafado" nas outras páginas (só com o site no ar, https)
+    abafadoHz: 700,                          // quanto menor, mais abafado (agudos cortados)
+    repetir: true,                           // volta ao começo quando termina
+    recomecarAoVoltar: false                 // true = ao voltar para a página, recomeça do início
   },
 
   /* ---- 7. Carta ---- */
   carta: {
-    abertura: "Minha Princesa,",
+    abertura: "Meu amor,",
     paragrafos: [
-      "obrigado por ser essa namorada incrível que você é, obrigado por ter paciência comigo sempre.",
-      "EUTEAMO, assim juntinhu, puq é como eu quero estar sempre ao seu lado meu amor 💜., "
+      "(exemplo) Esta carta é provisória. Escreva o texto aqui, um parágrafo por item da lista.",
+      "(exemplo) O envelope abre ao toque e a carta aparece com o texto que você colocar."
     ],
-    fechamento: "Com amor,"
+    fechamento: "Com todo o meu amor,"
   }
 };
 </script>
@@ -928,23 +932,61 @@ const MUSIC = (() => {
   const a = new Audio(src);
   a.preload = 'metadata'; a.loop = !!M.repetir; a.muted = SFX.muted;
   const probe = new Audio(); probe.volume = .5;
-  const canVol = probe.volume === .5;                 // iPhone ignora .volume: nesse caso o fade usa Web Audio
-  let gain = null;
-  if (!canVol && SFX.ctx()) {
-    try { const mes = SFX.ctx().createMediaElementSource(a); gain = SFX.ctx().createGain(); mes.connect(gain); gain.connect(SFX.ctx().destination); } catch (e) { gain = null; }
+  const canVol = probe.volume === .5;                 // iPhone ignora .volume
+  /* Com o site no ar (https) a música passa por: filtro passa-baixa (abafado) -> volume.
+     Abrindo o arquivo direto do computador isso não é possível: ali só o volume do <audio> é usado. */
+  let ctx = SFX.ctx(), gain = null, lpf = null;
+  if (ctx) {
+    try {
+      const node = ctx.createMediaElementSource(a);
+      lpf = ctx.createBiquadFilter(); lpf.type = 'lowpass'; lpf.frequency.value = 22000; lpf.Q.value = .7;
+      gain = ctx.createGain(); gain.gain.value = 0;
+      node.connect(lpf); lpf.connect(gain); gain.connect(ctx.destination);
+    } catch (e) { gain = lpf = null; }
   }
-  let vol = 0, timer = 0, wanted = false, userPaused = false, hiddenPause = false;
-  const setVol = v => { vol = v; if (gain) gain.gain.value = v; else if (canVol) a.volume = Math.max(0, Math.min(1, v)); };
-  function fade(to, ms, done) {
-    clearInterval(timer);
-    if (!gain && !canVol) { setVol(to); if (done) done(); return; }
+  const podeAoFundo = M.ficarAoFundo && (!!gain || canVol);
+  const NIVEL = {
+    full: { v: M.volume, hz: 22000 },
+    amb:  { v: M.volumeAoFundo, hz: (M.abafado && lpf) ? M.abafadoHz : 22000 },
+    off:  { v: 0, hz: 22000 }
+  };
+  let vol = 0, timer = 0, doneT = 0, started = false, onPage = false, userPaused = false, hiddenPause = false;
+  const aoVivo = () => (onPage ? 'full' : 'amb');
+  const ensureCtx = () => { if (ctx && ctx.state === 'suspended') ctx.resume(); };
+  function setVol(v) { vol = v; if (!gain && canVol) a.volume = Math.max(0, Math.min(1, v)); }
+
+  /* leva volume e abafamento ao nível pedido, suavemente */
+  function nivel(nome, ms, done) {
+    const N = NIVEL[nome];
+    clearInterval(timer); clearTimeout(doneT);
+    if (gain) {
+      const t = ctx.currentTime, d = Math.max(.02, ms / 1000);
+      gain.gain.cancelScheduledValues(t); gain.gain.setValueAtTime(gain.gain.value, t); gain.gain.linearRampToValueAtTime(N.v, t + d);
+      lpf.frequency.cancelScheduledValues(t); lpf.frequency.setValueAtTime(Math.max(20, lpf.frequency.value), t); lpf.frequency.exponentialRampToValueAtTime(Math.max(20, N.hz), t + d);
+      vol = N.v;
+      if (done) doneT = setTimeout(done, ms + 40);
+      return;
+    }
+    if (!canVol) { setVol(N.v); if (done) done(); return; }
     const from = vol, t0 = performance.now();
     timer = setInterval(() => {
       const k = Math.min(1, (performance.now() - t0) / ms);
-      setVol(from + (to - from) * k);
+      setVol(from + (N.v - from) * k);
       if (k === 1) { clearInterval(timer); if (done) done(); }
     }, 40);
   }
+  function silencio() {
+    clearInterval(timer); clearTimeout(doneT);
+    if (gain) { const t = ctx.currentTime; gain.gain.cancelScheduledValues(t); gain.gain.setValueAtTime(0, t); lpf.frequency.cancelScheduledValues(t); lpf.frequency.setValueAtTime(NIVEL[aoVivo()].hz, t); vol = 0; }
+    else setVol(0);
+  }
+  function tocar(ms) {
+    ensureCtx(); silencio();
+    const p = a.play();
+    const sobe = () => { if (started && !userPaused) nivel(aoVivo(), ms); };
+    if (p && p.then) p.then(sobe).catch(() => {}); else sobe();
+  }
+
   const fmt = t => isFinite(t) ? `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}` : '0:00';
   function paintTime() {
     const d = a.duration, t = a.currentTime;
@@ -965,20 +1007,25 @@ const MUSIC = (() => {
   });
   seek.addEventListener('input', () => { if (isFinite(a.duration)) a.currentTime = seek.value / 1000 * a.duration; paintTime(); });
 
-  function start(ms) {
-    setVol(0);
-    const p = a.play();
-    if (p && p.then) p.then(() => { if (wanted) fade(M.volume, ms); }).catch(() => {});
+  function enter() {
+    onPage = true; started = true; userPaused = false; ensureCtx();
+    if (M.recomecarAoVoltar) a.currentTime = 0;
+    if (a.paused) tocar(M.fadeEntrada); else nivel('full', M.fadeEntrada);
   }
-  function enter() { wanted = true; userPaused = false; if (M.recomecarAoVoltar) a.currentTime = 0; start(M.fadeEntrada); }
-  function leave() { wanted = false; fade(0, M.fadeSaida, () => { if (!wanted) a.pause(); }); }
+  function leave() {
+    onPage = false;
+    if (a.paused) return;
+    if (podeAoFundo) { nivel('amb', M.fadeSaida); return; }
+    started = false;
+    nivel('off', M.fadeSaida, () => { if (!onPage) a.pause(); });
+  }
   function toggle() {
-    if (a.paused) { userPaused = false; start(600); }
-    else { userPaused = true; fade(0, 400, () => a.pause()); }
+    if (a.paused) { userPaused = false; started = true; tocar(600); }
+    else { userPaused = true; nivel('off', 400, () => a.pause()); }
   }
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && !a.paused) { a.pause(); hiddenPause = true; }
-    else if (!document.hidden && hiddenPause) { hiddenPause = false; if (wanted && !userPaused) start(800); }
+    else if (!document.hidden && hiddenPause) { hiddenPause = false; if (started && !userPaused) tocar(800); }
   });
   $('#playBtn').addEventListener('click', toggle);
   $('#songTitle').textContent = M.titulo;
